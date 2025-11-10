@@ -4,96 +4,124 @@ import torch.nn.functional as F
 
 
 class CommutatorConv2d(nn.Module):
+    """
+    Альтернативный сверточный слой на основе матричного коммутатора и антикоммутатора.
+
+    Параметры:
+        in_channels (int): количество входных каналов.
+        out_channels (int): количество выходных каналов.
+        kernel_size (int): размер ядра (только нечётные значения, рекомендуется 3).
+        stride (int): шаг свёртки.
+        padding (int): тип заполнения границ.
+        adaptive_weights (bool): если True, λ_c и λ_a — обучаемые параметры.
+    """
+
     def __init__(
-        self, in_channels, kernel_size=3, stride=1, padding=0, adaptive=False, bias=True
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        adaptive_weights=False,
     ):
         super().__init__()
-        self.in_channels = in_channels
+        assert kernel_size % 2 == 1, "Ядро должно быть нечётного размера"
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
-        self.adaptive = adaptive
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
-        # Обучаемое ядро K: [k, k]
-        self.K = nn.Parameter(torch.randn(kernel_size, kernel_size))
-        nn.init.kaiming_uniform_(self.K, a=0)  # инициализация как в стандартной свёртке
+        # Обучаемые веса фильтров: [out_channels, in_channels, k, k]
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, kernel_size, kernel_size)
+        )
+        self.bias = nn.Parameter(torch.empty(out_channels))
 
-        # Смещение (bias)
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(1))
+        # Коэффициенты вклада коммутатора и антикоммутатора
+        if adaptive_weights:
+            # Начальная инициализация: λ_c = 0, λ_a = 1 (поведение как у классической свёртки)
+            self.lambda_c = nn.Parameter(torch.tensor(0.0))
+            self.lambda_a = nn.Parameter(torch.tensor(1.0))
         else:
-            self.register_parameter("bias", None)
+            self.lambda_c = 0.0
+            self.lambda_a = 1.0
 
-        # Обучаемые коэффициенты λc, λa (скаляры)
-        if adaptive:
-            self.lambda_c = nn.Parameter(torch.tensor(0.0))  # начальное значение: 0
-            self.lambda_a = nn.Parameter(torch.tensor(1.0))  # начальное значение: 1
-        else:
-            # фиксированные значения (можно менять вручную)
-            self.register_buffer("lambda_c", torch.tensor(0.0))
-            self.register_buffer("lambda_a", torch.tensor(1.0))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Инициализация весов по Каймину Хе (He initialization)
+        nn.init.kaiming_uniform_(self.weight, a=0, mode="fan_in", nonlinearity="relu")
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / torch.sqrt(torch.tensor(fan_in))
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):
-        # x: [B, C_in, H, W]
-        B, C, H, W = x.shape
+        """
+        Вход: x ∈ R^(B, C_in, H, W)
+        Выход: y ∈ R^(B, C_out, H_out, W_out)
+        """
+        B, C_in, H, W = x.shape
         k = self.kernel_size
-        s = self.stride
-        p = self.padding
+        pad = self.padding
+        stride = self.stride
 
-        if p > 0:
-            x = F.pad(x, (p, p, p, p))  # padding: (left, right, top, bottom)
+        # Применение padding
+        if pad > 0:
+            x_padded = F.pad(x, (pad, pad, pad, pad), mode="constant", value=0)
+        else:
+            x_padded = x
 
-        # Извлечение всех локальных блоков размером k×k
-        # unfold возвращает: [B, C, k*k, L], где L — число позиций
-        patches = x.unfold(2, k, s).unfold(3, k, s)  # [B, C, H_out, W_out, k, k]
-        H_out, W_out = patches.shape[2], patches.shape[3]
-        patches = patches.contiguous()  # для эффективного reshape
+        H_out = (H + 2 * pad - k) // stride + 1
+        W_out = (W + 2 * pad - k) // stride + 1
 
-        # Преобразуем в [B, C, H_out * W_out, k, k]
-        patches = patches.view(B, C, -1, k, k)  # [B, C, N, k, k], N = H_out*W_out
+        # Инициализация выходного тензора
+        y = torch.zeros(
+            B, self.out_channels, H_out, W_out, device=x.device, dtype=x.dtype
+        )
 
-        # Ядро K: [k, k] → расширяем до [1, 1, 1, k, k] для бродкастинга
-        K = self.K.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, k, k]
+        # Итерация по позициям ядра (можно векторизовать, но для ясности оставлено явно)
+        for i in range(H_out):
+            for j in range(W_out):
+                # Извлечение локального блока: [B, C_in, k, k]
+                h_start, h_end = i * stride, i * stride + k
+                w_start, w_end = j * stride, j * stride + k
+                X_block = x_padded[
+                    :, :, h_start:h_end, w_start:w_end
+                ]  # [B, C_in, k, k]
 
-        # Матричные произведения: X @ K^T и K^T @ X
-        # Используем torch.einsum для читаемости и контроля
-        XK = torch.einsum("bcnij,jk->bcnik", patches, K.squeeze().T)  # [B, C, N, k, k]
-        KX = torch.einsum("jk,bcnki->bcnji", K.squeeze().T, patches)  # [B, C, N, k, k]
+                # Для каждого выходного канала
+                for out_ch in range(self.out_channels):
+                    K = self.weight[out_ch]  # [C_in, k, k]
 
-        # Коммутатор и антикоммутатор
-        commutator = XK - KX  # [B, C, N, k, k]
-        anticommutator = XK + KX  # [B, C, N, k, k]
+                    # Компоненты по каждому входному каналу
+                    comm_sum = 0.0
+                    anticom_sum = 0.0
 
-        # Агрегация: сумма всех элементов матрицы → скаляр на блок
-        comm_sum = commutator.sum(dim=(-2, -1))  # [B, C, N]
-        anti_sum = anticommutator.sum(dim=(-2, -1))  # [B, C, N]
+                    for in_ch in range(C_in):
+                        X_ch = X_block[:, in_ch, :, :]  # [B, k, k]
+                        K_ch = K[in_ch, :, :]  # [k, k]
 
-        # Комбинируем с λ и суммируем по каналам
-        out = self.lambda_c * comm_sum + self.lambda_a * anti_sum  # [B, C, N]
-        out = out.sum(dim=1)  # сумма по входным каналам → [B, N]
+                        # Матричные произведения
+                        XK = torch.matmul(X_ch, K_ch)  # [B, k, k]
+                        KX = torch.matmul(K_ch, X_ch)  # [B, k, k]
 
-        # Добавляем смещение
-        if self.bias is not None:
-            out = out + self.bias
+                        comm = XK - KX  # коммутатор
+                        anticom = XK + KX  # антикоммутатор
 
-        # Возвращаем в форму признаковой карты: [B, 1, H_out, W_out]
-        out = out.view(B, 1, H_out, W_out)
-        return out
+                        # Агрегация: сумма всех элементов (1^T M 1)
+                        comm_sum += comm.sum(dim=(1, 2))  # [B]
+                        anticom_sum += anticom.sum(dim=(1, 2))  # [B]
 
-# Создаём слой
-layer = CommutatorConv2d(
-    in_channels=1, kernel_size=3, stride=1, padding=1, adaptive=True
-)
+                    # Линейная комбинация
+                    activation = (
+                        self.lambda_c * comm_sum
+                        + self.lambda_a * anticom_sum
+                        + self.bias[out_ch]
+                    )  # [B]
 
-# Пример входа: один канал, изображение 28×28
-x = torch.randn(4, 1, 28, 28)  # batch=4
+                    y[:, out_ch, i, j] = activation
 
-# Прямой проход
-y = layer(x)
-print("Вход:", x.shape)  # [4, 1, 28, 28]
-print("Выход:", y.shape)  # [4, 1, 28, 28]
-
-# Проверим, что градиенты проходят
-y.sum().backward()
-print("λ_c.grad =", layer.lambda_c.grad)
-print("K.grad =", layer.K.grad is not None)
+        return y

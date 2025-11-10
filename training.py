@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torchvision import datasets, transforms
 
-from simple_cnn import SimpleCNN
+from simple_cnn1 import SimpleCNN
 
 model = SimpleCNN(use_commutator=True)
 criterion = nn.CrossEntropyLoss()
