@@ -2,7 +2,7 @@ import torch
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 import numpy as np
-from simple_cnn1 import SimpleCNN
+from simple_cnn import SimpleCNN
 
 # Устройство
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -37,7 +37,7 @@ classes = [
 
 
 def evaluate_model(model, test_loader):
-    """Полная оценка модели без sklearn"""
+    """Полная оценка модели"""
     model.eval()
     correct = 0
     total = 0
@@ -272,7 +272,7 @@ analyze_per_class_accuracy(cm, classes)
 
 # Сравнение с базовыми показателями
 print(f"\n{'=' * 50}")
-print("СРАВНЕНИЕ С БАЗОВЫМИ ПОКАЗАТЕЛЯМИ:")
+print("СРАВНЕНИЕ С БАЗОВЫМИ ПОКАЗАТЕЛЯМИ:")+
 print(f"{'=' * 50}")
 print(f"Ваша модель с CommutatorConv2d: {accuracy:.2f}%")
 print("Случайное угадывание: ~10.00%")
